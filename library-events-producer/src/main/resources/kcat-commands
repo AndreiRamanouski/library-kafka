@@ -1,0 +1,6 @@
+
+//consumer mode
+kcat -C -b localhost:9092 -t library-events
+
+//list brokers and topics
+kcat -L -b localhost:9092
