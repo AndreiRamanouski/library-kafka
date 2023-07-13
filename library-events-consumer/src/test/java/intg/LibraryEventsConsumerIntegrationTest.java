@@ -15,16 +15,20 @@ import com.library.events.consumer.entity.LibraryEvent;
 import com.library.events.consumer.entity.LibraryEventType;
 import com.library.events.consumer.jpa.BookRepository;
 import com.library.events.consumer.jpa.LibraryEventsRepository;
+import com.library.events.consumer.service.FailureService;
 import com.library.events.consumer.service.LibraryEventService;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
@@ -33,6 +37,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
 import org.springframework.boot.test.mock.mockito.SpyBean;
@@ -48,9 +53,9 @@ import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.TestPropertySource;
 
 @SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
-@EmbeddedKafka(topics = {"library-events"}, partitions = 3)
+@EmbeddedKafka(topics = {"library-events", "library-events.RETRY", "library-events.DLT"}, partitions = 3)
 @TestPropertySource(properties = {"spring.kafka.producer.bootstrap-servers=${spring.embedded.kafka.brokers}",
-        "spring.kafka.consumer.bootstrap-servers=${spring.embedded.kafka.brokers}"})
+        "spring.kafka.consumer.bootstrap-servers=${spring.embedded.kafka.brokers}", "retryListener.startup=false"})
 @ContextConfiguration(classes = {LibraryEventsConsumerApplication.class, KafkaConsumerConfig.class})
 public class LibraryEventsConsumerIntegrationTest {
 
@@ -80,11 +85,23 @@ public class LibraryEventsConsumerIntegrationTest {
 
     private Consumer<Integer, String> consumer;
 
+    @Value("${topics.retry}")
+    String retryTopic;
+    @Value("${topics.dlt}")
+    String deadLetterTopic;
+
     @BeforeEach
     public void setUp() {
-        for (MessageListenerContainer messageListenerContainer : kafkaListenerEndpointRegistry.getListenerContainers()) {
-            ContainerTestUtils.waitForAssignment(messageListenerContainer, embeddedKafkaBroker.getPartitionsPerTopic());
-        }
+
+        MessageListenerContainer messageListenerContainer = kafkaListenerEndpointRegistry.getListenerContainers()
+                .stream().filter(container -> Objects.equals(container.getGroupId(), "library-events-listener"))
+                .toList().get(0);
+        ContainerTestUtils.waitForAssignment(messageListenerContainer, embeddedKafkaBroker.getPartitionsPerTopic());
+
+        //        for (MessageListenerContainer messageListenerContainer : kafkaListenerEndpointRegistry.getListenerContainers()) {
+        //            ContainerTestUtils.waitForAssignment(messageListenerContainer, embeddedKafkaBroker.getPartitionsPerTopic());
+        //        }
+
     }
 
     @AfterEach
@@ -140,16 +157,17 @@ public class LibraryEventsConsumerIntegrationTest {
 
 
     @Test
-    void publishModifyLibraryEvent_Not_A_Valid_LibraryEventId() throws JsonProcessingException, InterruptedException, ExecutionException {
+    void publishModifyLibraryEvent_Not_A_Valid_LibraryEventId()
+            throws JsonProcessingException, InterruptedException, ExecutionException {
         //given
         Integer libraryEventId = 123;
-        String json = "{\"libraryEventId\":" + libraryEventId + ",\"libraryEventType\":\"UPDATE\",\"book\":{\"bookId\":456,\"bookName\":\"Kafka Using Spring Boot\",\"bookAuthor\":\"Dilip\"}}";
+        String json = "{\"libraryEventId\":" + libraryEventId
+                + ",\"libraryEventType\":\"UPDATE\",\"book\":{\"bookId\":456,\"bookName\":\"Kafka Using Spring Boot\",\"bookAuthor\":\"Dilip\"}}";
         System.out.println(json);
         kafkaTemplate.sendDefault(libraryEventId, json).get();
         //when
         CountDownLatch latch = new CountDownLatch(1);
         latch.await(5, TimeUnit.SECONDS);
-
 
         verify(libraryEventsConsumerSpy, times(1)).onMessage(isA(ConsumerRecord.class));
         verify(libraryEventsServiceSpy, times(1)).processLibraryEvent(isA(ConsumerRecord.class));
@@ -157,26 +175,31 @@ public class LibraryEventsConsumerIntegrationTest {
         Optional<LibraryEvent> libraryEventOptional = libraryEventsRepository.findById(libraryEventId);
         assertFalse(libraryEventOptional.isPresent());
 
-        Map<String, Object> configs = new HashMap<>(KafkaTestUtils.consumerProps("group2", "true", embeddedKafkaBroker));
-        consumer = new DefaultKafkaConsumerFactory<>(configs, new IntegerDeserializer(), new StringDeserializer()).createConsumer();
-//        embeddedKafkaBroker.consumeFromAnEmbeddedTopic(consumer, deadLetterTopic);
-//
-//        ConsumerRecord<Integer, String> consumerRecord = KafkaTestUtils.getSingleRecord(consumer, deadLetterTopic);
-//
-//        System.out.println("consumer Record in deadletter topic : " + consumerRecord.value());
-//
-//        assertEquals(json, consumerRecord.value());
-//        consumerRecord.headers()
-//                .forEach(header -> {
-//                    System.out.println("Header Key : " + header.key() + ", Header Value : " + new String(header.value()));
-//                });
+        Map<String, Object> configs = new HashMap<>(
+                KafkaTestUtils.consumerProps("group2", "true", embeddedKafkaBroker));
+        consumer = new DefaultKafkaConsumerFactory<>(configs, new IntegerDeserializer(),
+                new StringDeserializer()).createConsumer();
+
+        embeddedKafkaBroker.consumeFromAnEmbeddedTopic(consumer, retryTopic);
+
+        ConsumerRecord<Integer, String> consumerRecord = KafkaTestUtils.getSingleRecord(consumer, retryTopic);
+
+        System.out.println("consumer Record in deadletter topic : " + consumerRecord.value());
+
+        assertEquals(json, consumerRecord.value());
+        consumerRecord.headers()
+                .forEach(header -> {
+                    System.out.println(
+                            "Header Key : " + header.key() + ", Header Value : " + new String(header.value()));
+                });
 
 
     }
 
 
     @Test
-    void publishModifyLibraryEvent_Null_LibraryEventId() throws JsonProcessingException, InterruptedException, ExecutionException {
+    void publishModifyLibraryEvent_Null_LibraryEventId()
+            throws JsonProcessingException, InterruptedException, ExecutionException {
         //given
         Integer libraryEventId = null;
         String json = "{\"libraryEventId\":" + libraryEventId
@@ -186,8 +209,8 @@ public class LibraryEventsConsumerIntegrationTest {
         CountDownLatch latch = new CountDownLatch(1);
         latch.await(3, TimeUnit.SECONDS);
 
-        verify(libraryEventsConsumerSpy, times(6)).onMessage(isA(ConsumerRecord.class));
-        verify(libraryEventsServiceSpy, times(6)).processLibraryEvent(isA(ConsumerRecord.class));
+        verify(libraryEventsConsumerSpy, times(1)).onMessage(isA(ConsumerRecord.class));
+        verify(libraryEventsServiceSpy, times(1)).processLibraryEvent(isA(ConsumerRecord.class));
 
     }
 

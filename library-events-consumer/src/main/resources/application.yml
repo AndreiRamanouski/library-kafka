@@ -1,6 +1,10 @@
 spring:
   profiles:
     active: local
+
+topics:
+  retry: 'library-events.RETRY'
+  dlt: 'library-events.DLT'
 ---
 spring:
   datasource:
@@ -9,7 +13,7 @@ spring:
   jpa:
     database: h2
     database-platform: org.hibernate.dialect.H2Dialect
-    generate-ddl: true
+    hibernate.ddl-auto: create-drop
   h2:
     console:
       enabled: true
