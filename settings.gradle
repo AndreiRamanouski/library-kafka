@@ -1,2 +1,3 @@
 rootProject.name = 'library-kafka'
 include ':library-events-producer'
+include ':library-events-consumer'
